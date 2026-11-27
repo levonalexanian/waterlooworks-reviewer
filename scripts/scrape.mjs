@@ -10,6 +10,7 @@ import { parseEnv } from 'node:util';
 const root = dirname(import.meta.dirname);
 const portal = 'https://waterlooworks.uwaterloo.ca';
 const loginURL = portal + '/employer/login.htm';
+const dashboardURL = portal + '/myAccount/dashboard.htm';
 
 export function jobIds(value) {
   const ids = [...new Set((value || '').split(/[,\s]+/).filter(Boolean))];
@@ -38,7 +39,7 @@ async function signIn(context, email, password, ask) {
       return;
     }
     const emailField = page.getByLabel(/^email:?$/i).or(
-      page.locator('input[type=email],input[autocomplete=username],input[name*=email i]'));
+      page.locator('input#j_username,input[type=email],input[autocomplete=username],input[name*=email i]'));
     const passwordField = page.locator('input[type=password]');
     const submit = page.getByRole('button', { name: /^(log\s*in|sign\s*in|submit)$/i })
       .or(page.locator('input[type=submit], button[type=submit]')).first();
@@ -58,18 +59,15 @@ export async function openPosting(context, id, ask) {
   const heading = page.getByRole('heading', { level: 1, name: new RegExp(`^${id}\\s*[-–—]`) });
   if (await heading.isVisible()) return page;
   try {
-    const back = page.getByRole('button', { name: /Back to Jobs Overview/i });
-    if (await back.isVisible()) await back.click();
+    if (page.url() !== dashboardURL) await page.goto(dashboardURL, { waitUntil: 'domcontentloaded' });
     const postings = page.getByRole('tab', { name: 'Job Postings', exact: true });
-    if (await postings.isVisible()) {
-      await postings.getByRole('link', { name: 'Job Postings', exact: true }).click();
-    }
+    await postings.getByRole('link', { name: 'Job Postings', exact: true }).click({ timeout: 10000 });
 
     const idCell = page.getByRole('gridcell', { name: id, exact: true })
       .or(page.getByRole('cell', { name: id, exact: true }));
     const row = page.getByRole('row').filter({ has: idCell });
     await row.getByRole('link', { name: 'View Apps', exact: true }).click({ timeout: 10000 });
-    const currentTab = row.getByText('current tab', { exact: true });
+    const currentTab = row.getByRole('link', { name: /^current tab$/i });
     await currentTab.click({ timeout: 5000 });
     await heading.waitFor({ timeout: 10000 });
   } catch {
