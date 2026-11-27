@@ -5,7 +5,7 @@ import { basename, dirname, join } from 'node:path';
 import { stdin, stdout } from 'node:process';
 import { createInterface } from 'node:readline/promises';
 import { pathToFileURL } from 'node:url';
-import { parseEnv } from 'node:util';
+import { parseArgs, parseEnv } from 'node:util';
 
 const root = dirname(import.meta.dirname);
 const portal = 'https://waterlooworks.uwaterloo.ca';
@@ -35,7 +35,7 @@ async function signIn(context, email, password, ask) {
     await ask('Sign in to WaterlooWorks in Chrome, then press Enter here. ');
   } else {
     if (new URL(page.url()).origin !== portal) {
-      await ask('Complete sign-in in Chrome, then press Enter here. ');
+      await ask('Complete sign-in in Chrome, then press Enter here. ', 'WaterlooWorks redirected to a manual sign-in.');
       return;
     }
     const emailField = page.getByLabel(/^email:?$/i).or(
@@ -49,7 +49,7 @@ async function signIn(context, email, password, ask) {
       await submit.click({ timeout: 5000 });
       await page.getByRole('tab', { name: 'Job Postings', exact: true }).waitFor({ timeout: 8000 });
     } catch {
-      await ask('Finish sign-in or verification in Chrome, then press Enter here. ');
+      await ask('Finish sign-in or verification in Chrome, then press Enter here. ', 'WaterlooWorks sign-in could not be completed automatically.');
     }
   }
 }
@@ -71,7 +71,7 @@ export async function openPosting(context, id, ask) {
     await currentTab.click({ timeout: 5000 });
     await heading.waitFor({ timeout: 10000 });
   } catch {
-    await ask(`Open posting ${id} in Chrome, then press Enter. `);
+    await ask(`Open posting ${id} in Chrome, then press Enter. `, `Could not open posting ${id} automatically.`);
     await heading.waitFor({ timeout: 3000 });
   }
   return page;
@@ -147,17 +147,19 @@ export async function downloadRoster(context, page, directory, ask) {
       await total.click({ timeout: 8000 });
       await panel.getByRole('link', { name: 'Export', exact: true }).click({ timeout: 8000 });
     } catch {
-      await ask('In the Applications overview, choose Total Applications and Export. Press Enter after starting the download. ');
+      await ask('In the Applications overview, choose Total Applications and Export. Press Enter after starting the download. ', 'Could not export the applicant roster automatically.');
     }
   });
 }
 
 export async function downloadBundle(context, page, directory, ask) {
   return capture(context, directory, /\.(zip|pdf)$/i, async () => {
+    let step = 'opening the bundle list';
     try {
       const panel = applicationsPanel(page);
       const zipRows = panel.getByRole('row').filter({
-        has: page.getByRole('gridcell', { name: 'ZIP', exact: true }),
+        has: page.getByRole('gridcell', { name: 'ZIP', exact: true })
+          .or(page.getByRole('cell', { name: 'ZIP', exact: true })),
       });
       await panel.getByRole('link', { name: 'View Application Bundle', exact: true }).click();
       await panel.getByRole('columnheader', { name: 'File Type', exact: true })
@@ -165,19 +167,26 @@ export async function downloadBundle(context, page, directory, ask) {
         .waitFor({ timeout: 10000 });
       const previous = new Set(await zipRows.allTextContents());
 
+      step = 'opening Applications Options';
       await openApplicationOptions(page);
       await page.getByRole('link', { name: 'Download All Applications', exact: true }).click();
-      await page.getByRole('button', { name: 'Bundle as Individual PDFs', exact: true }).click();
-      await page.getByText('Bundle was successfully created.', { exact: true }).waitFor({ timeout: 90000 });
+      step = 'requesting the individual PDF bundle';
+      await page.getByRole('button', { name: /^Bundle as Individual PDFs$/i }).click({ timeout: 10000 });
+      step = 'waiting for the bundle confirmation';
+      await page.getByText(/Bundle was successfully created\./i).filter({ visible: true }).first()
+        .waitFor({ timeout: 90000 });
+      step = 'closing the bundle confirmation';
       await page.getByRole('button', { name: 'X', exact: true }).click();
+      step = 'finding the new ZIP';
       await zipRows.first().waitFor({ timeout: 10000 });
       const rows = await zipRows.allTextContents();
       const newRows = rows.flatMap((text, index) => previous.has(text) ? [] : [index]);
       if (newRows.length !== 1) throw new Error('Could not uniquely identify the new ZIP bundle.');
+      step = 'starting the ZIP download';
       await zipRows.nth(newRows[0]).getByRole('combobox', { name: 'Options', exact: true })
         .selectOption({ label: 'Download Bundle' });
     } catch {
-      await ask('In the posting’s bundle list, choose Download Bundle on the new ZIP. If needed, first create it through Applications Options > Download All Applications > Bundle as Individual PDFs. Press Enter after starting the download. ');
+      await ask('In the posting’s bundle list, choose Download Bundle on the new ZIP. If needed, first create it through Applications Options > Download All Applications > Bundle as Individual PDFs. Press Enter after starting the download. ', `The scraper stopped while ${step}.`);
     }
   });
 }
@@ -191,7 +200,8 @@ function finishBatch(id, directory, roster, bundles) {
 }
 
 async function main() {
-  if (!stdin.isTTY) throw new Error('Run this command in Terminal so you can complete sign-in and any download prompts.');
+  const { values: { headed = false } } = parseArgs({ options: { headed: { type: 'boolean' } } });
+  if (headed && !stdin.isTTY) throw new Error('Run make scrape HEADED=1 in an interactive terminal.');
   const envPath = join(root, '.env');
   const info = await stat(envPath);
   if ((info.mode & 0o077) !== 0) throw new Error('Run chmod 600 .env before adding or using credentials.');
@@ -200,12 +210,16 @@ async function main() {
   const email = config.WATERLOOWORKS_EMAIL || '';
   const password = config.WATERLOOWORKS_PASSWORD || '';
   if (Boolean(email) !== Boolean(password)) throw new Error('Fill both credential fields, or leave both blank to sign in manually.');
+  if (!headed && !email) throw new Error('Set both credential fields in .env for background scraping, or run make scrape HEADED=1 to sign in manually.');
   const require = createRequire(import.meta.url);
   const { chromium } = require(join(root, '.local', 'node', 'node_modules', 'playwright'));
   process.umask(0o077);
-  const browser = await chromium.launch({ headless: false });
-  const terminal = createInterface({ input: stdin, output: stdout });
-  const ask = message => terminal.question(message);
+  const browser = await chromium.launch({ headless: !headed });
+  const terminal = headed ? createInterface({ input: stdin, output: stdout }) : null;
+  const ask = (message, reason) => {
+    if (terminal) return terminal.question(message);
+    throw new Error(`${reason} Run make scrape HEADED=1 to continue in Chrome.`);
+  };
   try {
     const context = await browser.newContext({ acceptDownloads: true });
     await signIn(context, email, password, ask);
@@ -230,7 +244,7 @@ async function main() {
       }
     }
   } finally {
-    terminal.close();
+    terminal?.close();
     await browser.close();
   }
 }

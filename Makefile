@@ -23,7 +23,7 @@ $(PLAYWRIGHT):
 	npm install --prefix .local/node --no-save --no-package-lock --no-audit --no-fund playwright@$(PLAYWRIGHT_VERSION)
 
 scrape:
-	WW_PYTHON="$(PYTHON)" node scripts/scrape.mjs
+	WW_PYTHON="$(PYTHON)" node scripts/scrape.mjs $(if $(filter 1,$(HEADED)),--headed)
 
 seed:
 	@test -n "$$BATCH" || { echo 'Pass BATCH=path-to-download-directory'; exit 2; }
