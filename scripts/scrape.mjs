@@ -1,17 +1,15 @@
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { stdin, stdout } from 'node:process';
 import { createInterface } from 'node:readline/promises';
 import { pathToFileURL } from 'node:url';
 import { parseEnv } from 'node:util';
 
-const root = import.meta.dirname;
+const root = dirname(import.meta.dirname);
 const portal = 'https://waterlooworks.uwaterloo.ca';
 const loginURL = portal + '/employer/login.htm';
-const runtime = join(homedir(), '.cache/codex-runtimes/codex-primary-runtime/dependencies');
 
 export function jobIds(value) {
   const ids = [...new Set((value || '').split(/[,\s]+/).filter(Boolean))];
@@ -187,16 +185,11 @@ export async function downloadBundle(context, page, directory, ask) {
 }
 
 function finishBatch(id, directory, roster, bundles) {
-  const python = join(runtime, 'python/bin/python3');
-  let result = spawnSync(python, [join(root, 'prepare-waterlooworks.py'), id, directory, roster, ...bundles], {
-    stdio: 'inherit',
-  });
-  if (result.error?.code === 'ENOENT') {
-    result = spawnSync('python3', [join(root, 'prepare-waterlooworks.py'), id, directory, roster, ...bundles], {
-      stdio: 'inherit',
-    });
-  }
-  if (result.status !== 0) throw new Error('The batch did not pass validation. Its original downloads are still in the job folder.');
+  const python = process.env.WW_PYTHON || 'python3';
+  const seed = join(import.meta.dirname, 'seed.py');
+  const result = spawnSync(python, [seed, 'prepare', id, directory, roster, ...bundles], { stdio: 'inherit' });
+  if (result.error) throw new Error(`Could not run the batch validator: ${result.error.message}`);
+  if (result.status !== 0) throw new Error('Batch validation failed. The original downloads are in the batch folder.');
 }
 
 async function main() {
@@ -210,30 +203,27 @@ async function main() {
   const password = config.WATERLOOWORKS_PASSWORD || '';
   if (Boolean(email) !== Boolean(password)) throw new Error('Fill both credential fields, or leave both blank to sign in manually.');
   const require = createRequire(import.meta.url);
-  let playwright;
-  try { playwright = require('playwright'); }
-  catch {
-    try { playwright = require(join(runtime, 'node/node_modules/playwright')); }
-    catch { throw new Error('Playwright is unavailable. Run npm install --no-save playwright in this folder.'); }
-  }
-
+  const { chromium } = require(join(root, '.local', 'node', 'node_modules', 'playwright'));
   process.umask(0o077);
-  const browser = await playwright.chromium.launch({ channel: 'chrome', headless: false });
+  const browser = await chromium.launch({ headless: false });
   const terminal = createInterface({ input: stdin, output: stdout });
   const ask = message => terminal.question(message);
   try {
     const context = await browser.newContext({ acceptDownloads: true });
     await signIn(context, email, password, ask);
     for (const id of ids) {
-      const jobRoot = join(root, 'local', 'waterlooworks', id);
+      const jobRoot = join(root, '.local', 'batches', id);
       await mkdir(jobRoot, { recursive: true, mode: 0o700 });
       const batch = await mkdtemp(join(jobRoot, 'batch-'));
       console.log(`Job ${id}: ${batch}`);
       try {
-        await openPosting(context, id, ask);
-        const roster = await downloadRoster(context, portalPage(context), join(batch, 'roster'), ask);
+        const page = await openPosting(context, id, ask);
+        const heading = page.getByRole('heading', { level: 1, name: new RegExp(`^${id}\\s*[-–—]`) });
+        const title = (await heading.innerText()).replace(/^\d+\s*[-–—]\s*/, '').trim();
+        await writeFile(join(batch, 'job.json'), JSON.stringify({ id, title }, null, 2) + '\n');
+        const roster = await downloadRoster(context, page, join(batch, 'roster'), ask);
         if (roster.length !== 1) throw new Error('Expected one applicant roster export. Rerun and export only once.');
-        const bundles = await downloadBundle(context, portalPage(context), join(batch, 'bundles'), ask);
+        const bundles = await downloadBundle(context, page, join(batch, 'bundles'), ask);
         finishBatch(id, batch, roster[0], bundles);
       } catch (error) {
         const message = error instanceof Error ? error.message.split('\n')[0] : 'Download failed.';

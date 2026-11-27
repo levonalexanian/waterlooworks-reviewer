@@ -1,19 +1,176 @@
-"""Import the supplied Waterloo export and matched application bundles. Never overwrites reviews."""
+"""Validate WaterlooWorks downloads and seed a local review database per posting."""
 import argparse
 import collections
 import csv
 import datetime as dt
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from collections import Counter
 import re
 import shutil
 import sqlite3
 from tempfile import TemporaryDirectory
+import warnings
+from zipfile import BadZipFile, ZipFile
 
 from pypdf import PdfReader
 
-ROOT = Path(__file__).resolve().parent
+POSTINGS = Path(__file__).resolve().parents[1] / '.local/postings'
+
+ID_HEADERS = ("id", "applicant id", "student id")
+MAX_PDF_BYTES = 150 * 1024**2
+MAX_BATCH_BYTES = 4 * 1024**3
+COVER_SHEET = "- selected applicants list -.pdf"
+
+
+def clean(value):
+    return str(value).strip() if value is not None else ""
+
+
+def read_roster(path):
+    if path.suffix.lower() == ".csv":
+        raw = path.read_bytes()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("cp1252")
+        return list(csv.reader(text.splitlines(keepends=True)))
+
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise ValueError("Install the project's requirements.txt to convert an Excel export.") from None
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Workbook contains no default style")
+        workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        sheet = workbook.active
+        sheet.reset_dimensions()
+        return [[clean(value) for value in row] for row in sheet.values]
+    finally:
+        workbook.close()
+
+
+def applicant_rows(rows):
+    for index, row in enumerate(rows):
+        headers = [clean(value).casefold() for value in row]
+        matches = [i for i, name in enumerate(headers) if name in ID_HEADERS]
+        if len(matches) != 1:
+            continue
+        id_index = matches[0]
+        data = [row for row in rows[index + 1:] if any(clean(value) for value in row)]
+        ids = [clean(row[id_index]) if len(row) > id_index else "" for row in data]
+        if any(not re.fullmatch(r"\d+", cid) for cid in ids):
+            raise ValueError("The applicant export contains rows without a numeric applicant ID.")
+        declared = next((
+            int(clean(item[1])) for item in rows[:index]
+            if len(item) >= 2 and clean(item[0]).casefold().rstrip(":") == "total records exported"
+            and clean(item[1]).isdigit()
+        ), None)
+        return rows[index], data, ids, declared
+    raise ValueError("Could not find the applicant ID column in the CSV or Excel export.")
+
+
+def save_pdf(source, filename, destination, size, total):
+    name = PurePosixPath(filename.replace("\\", "/")).name
+    if name.startswith(".") or not name.lower().endswith(".pdf"):
+        return None
+    if any(ord(char) < 32 for char in name):
+        raise ValueError("The bundle contains an invalid filename.")
+    if size > MAX_PDF_BYTES or total + size > MAX_BATCH_BYTES:
+        raise ValueError("The PDF download exceeds the permitted batch size.")
+    prefix = source.read(5)
+    if prefix != b"%PDF-":
+        raise ValueError("A downloaded PDF is unreadable or is an error page.")
+    path = destination / name
+    if path.exists():
+        raise ValueError("Two downloaded PDFs have the same filename.")
+    with path.open("xb") as output:
+        output.write(prefix)
+        shutil.copyfileobj(source, output)
+    return name
+
+
+def unpack_pdfs(paths, destination):
+    destination.mkdir(mode=0o700)
+    files = []
+    cover_sheets = []
+    total = 0
+    for path in paths:
+        if path.suffix.lower() == ".pdf":
+            size = path.stat().st_size
+            with path.open("rb") as stream:
+                name = save_pdf(stream, path.name, destination, size, total)
+            if name:
+                files.append(name)
+                total += size
+            continue
+        with ZipFile(path) as archive:
+            for member in archive.infolist():
+                if member.is_dir() or not member.filename.lower().endswith(".pdf"):
+                    continue
+                name = PurePosixPath(member.filename.replace("\\", "/")).name
+                is_cover_sheet = name.casefold() == COVER_SHEET
+                folder = destination
+                if is_cover_sheet:
+                    folder = destination.parent / "bundle-documents"
+                    folder.mkdir(mode=0o700, exist_ok=True)
+                with archive.open(member) as stream:
+                    name = save_pdf(stream, member.filename, folder, member.file_size, total)
+                if name:
+                    (cover_sheets if is_cover_sheet else files).append(name)
+                    total += member.file_size
+    return files, cover_sheets
+
+
+def safe_cell(value):
+    value = clean(value)
+    # The source export remains available with the original values.
+    return "'" + value if value[:1] in ("=", "+", "-", "@") else value
+
+
+def prepare(job_id, batch, export, bundles):
+    headers, rows, ids, declared = applicant_rows(read_roster(export))
+    with (batch / "applicants.csv").open("x", encoding="utf-8-sig", newline="") as output:
+        writer = csv.writer(output)
+        writer.writerow(headers)
+        writer.writerows([safe_cell(value) for value in row] for row in rows)
+
+    files, cover_sheets = unpack_pdfs(bundles, batch / "pdfs")
+    pattern = re.compile(rf"-(\d+)-{re.escape(job_id)}(?:[-_. ]|$)")
+    counts = Counter()
+    unmatched = []
+    for name in files:
+        match = pattern.search(name)
+        if match:
+            counts[match[1]] += 1
+        else:
+            unmatched.append(name)
+    roster_counts = Counter(ids)
+    report = {
+        "job_id": job_id,
+        "export_reported_count": declared,
+        "applicant_count": len(ids),
+        "pdf_count": len(files),
+        "bundle_documents": cover_sheets,
+        "missing_pdf_ids": sorted(roster_counts.keys() - counts.keys()),
+        "extra_pdf_ids": sorted(counts.keys() - roster_counts.keys()),
+        "duplicate_roster_ids": sorted(cid for cid, count in roster_counts.items() if count > 1),
+        "duplicate_pdf_ids": sorted(cid for cid, count in counts.items() if count > 1),
+        "unmatched_pdf_filenames": sorted(unmatched),
+    }
+    report["complete"] = (declared is None or declared == len(ids)) and all(
+        not report[key] for key in ("missing_pdf_ids", "extra_pdf_ids", "duplicate_roster_ids",
+                                    "duplicate_pdf_ids", "unmatched_pdf_filenames")
+    )
+    (batch / "download-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(f"Job {job_id}: {len(ids)} applicant rows, {len(files)} PDFs. "
+          f"{'All applicant IDs matched.' if report['complete'] else 'See download-report.json for gaps.'}")
+    return report["complete"]
+
+
 SKILLS = {
     'Python': r'python', 'JavaScript': r'javascript', 'TypeScript': r'typescript',
     'Java': r'java(?!script)', 'C++': r'c\+\+', 'C#': r'c#', 'C': r'c(?![+#])',
@@ -204,30 +361,55 @@ def import_batch(job_id, source, target_root):
     return len(records)
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Add a downloaded job to the separate jobs reviewer.')
-    parser.add_argument('job_id')
-    parser.add_argument('title')
-    parser.add_argument('batch', type=Path)
-    args = parser.parse_args()
-    if not re.fullmatch(r'[0-9]{1,12}', args.job_id) or not args.title.strip():
-        parser.error('A numeric posting ID and a non-empty job title are required.')
-    postings = ROOT / 'postings'
-    postings.mkdir(exist_ok=True, mode=0o700)
-    destination = postings / args.job_id
+def seed_batch(batch, title):
+    report = json.loads((batch / 'download-report.json').read_text())
+    job_id = report.get('job_id', '')
+    if not isinstance(job_id, str) or not re.fullmatch(r'[0-9]{1,12}', job_id):
+        raise ValueError('The download report does not contain a valid posting ID.')
+    metadata = batch / 'job.json'
+    if metadata.is_file():
+        job = json.loads(metadata.read_text())
+        if job.get('id') != job_id:
+            raise ValueError('The job metadata and download report have different IDs.')
+        title = title or job.get('title', '')
+    if not isinstance(title, str) or not title.strip():
+        raise ValueError('Set the job title with --title when the batch has no job metadata.')
+
+    POSTINGS.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination = POSTINGS / job_id
     if destination.exists():
-        parser.error('That posting is already in the reviewer. Existing selections were preserved.')
+        raise ValueError(f'Posting {job_id} is already in the reviewer. Its decisions were preserved.')
+    with TemporaryDirectory(dir=POSTINGS, prefix='.import-') as directory:
+        job_root = Path(directory) / 'job'
+        job_root.mkdir(mode=0o700)
+        count = import_batch(job_id, batch, job_root)
+        (job_root / 'job.json').write_text(json.dumps({'title': title.strip()}) + '\n')
+        job_root.rename(destination)
+    print(f'Added posting {job_id} with {count} applicants.')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='command', required=True)
+    validate = commands.add_parser('prepare', help='Validate a downloaded roster and extract its PDF bundles.')
+    validate.add_argument('job_id')
+    validate.add_argument('batch', type=Path)
+    validate.add_argument('roster', type=Path)
+    validate.add_argument('bundles', type=Path, nargs='+')
+    load = commands.add_parser('import', help='Seed a previously validated batch into the reviewer.')
+    load.add_argument('batch', type=Path)
+    load.add_argument('--title')
+    args = parser.parse_args()
     try:
-        with TemporaryDirectory(dir=postings, prefix='.import-') as directory:
-            job = Path(directory) / 'job'
-            job.mkdir(mode=0o700)
-            count = import_batch(args.job_id, args.batch.resolve(), job)
-            (job / 'job.json').write_text(json.dumps({'title': args.title.strip()}) + '\n')
-            job.rename(destination)
-    except (OSError, ValueError) as error:
-        parser.exit(1, f'Could not add posting: {error}\n')
-    print(f'Added posting {args.job_id} with {count} applicants.')
+        if args.command == 'prepare':
+            if not re.fullmatch(r'[0-9]{1,12}', args.job_id):
+                parser.error('A numeric posting ID is required.')
+            return 0 if prepare(args.job_id, args.batch, args.roster, args.bundles) else 2
+        seed_batch(args.batch.resolve(), args.title)
+    except (BadZipFile, OSError, ValueError) as error:
+        parser.exit(1, f'Batch preparation failed: {error}\n')
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

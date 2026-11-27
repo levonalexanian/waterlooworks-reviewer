@@ -1,0 +1,15 @@
+{
+  "name": "WaterlooWorks Applicant Reviewer",
+  "build": { "dockerfile": "Dockerfile" },
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" },
+    "ghcr.io/devcontainers/features/desktop-lite:1": {}
+  },
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y make poppler-utils && make setup PW_INSTALL_FLAGS=--with-deps",
+  "forwardPorts": [6080, 8767],
+  "portsAttributes": {
+    "6080": { "label": "Browser desktop" },
+    "8767": { "label": "Application reviewer" }
+  },
+  "remoteUser": "vscode"
+}
