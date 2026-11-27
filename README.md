@@ -2,6 +2,8 @@
 
 Download application packages from WaterlooWorks and review candidates locally, one job posting at a time.
 
+![Applicant review screen with a fictional résumé, extracted profile, and decision buttons](https://raw.githubusercontent.com/levonalexanian/waterlooworks-applicant-reviewer/7cac22e82368dbd449c7d34b08a8390e10be8ac3/reviewer-preview.png)
+
 ## Setup
 
 Open the repository in its dev container. It installs the tools and creates a blank `.env`. For a local installation, have Node.js 22+, Python 3.10+, Make, and Poppler installed, then run `make setup`.
