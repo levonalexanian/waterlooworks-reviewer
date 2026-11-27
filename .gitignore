@@ -1,0 +1,25 @@
+# Account credentials and browser state
+.env
+.env.*
+!.env.example
+node_modules/
+
+# Applicant exports and reviewer data
+local/
+postings/
+originals/
+data/
+*.sqlite*
+*.db
+*.db-wal
+*.db-shm
+*.csv
+*.xlsx
+*.zip
+*.pdf
+
+# Local caches
+__pycache__/
+*.pyc
+*.log
+.DS_Store
